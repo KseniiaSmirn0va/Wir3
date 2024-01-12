@@ -2,7 +2,9 @@ package engine
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -52,9 +54,10 @@ type Printer interface {
 
 type Engine struct {
 	// CLI flags.
-	concurrency uint8
-	decoders    []decoders.Decoder
-	detectors   []detectors.Detector
+	concurrency     uint8
+	decoders        []decoders.Decoder
+	detectors       []detectors.Detector
+	jobReportWriter io.WriteCloser
 	// filterUnverified is used to reduce the number of unverified results.
 	// If there are multiple unverified results for the same chunk for the same detector,
 	// only the first one will be kept.
@@ -95,6 +98,12 @@ type Engine struct {
 
 // Option is used to configure the engine during initialization using functional options.
 type Option func(*Engine)
+
+func WithJobReportWriter(w io.WriteCloser) Option {
+	return func(e *Engine) {
+		e.jobReportWriter = w
+	}
+}
 
 func WithConcurrency(concurrency uint8) Option {
 	return func(e *Engine) {
@@ -279,6 +288,7 @@ func Start(ctx context.Context, options ...Option) (*Engine, error) {
 	if err := e.initialize(ctx, options...); err != nil {
 		return nil, err
 	}
+	e.initSourceManager(ctx)
 	e.setDefaults(ctx)
 	e.sanityChecks(ctx)
 	e.startWorkers(ctx)
@@ -320,6 +330,40 @@ func (e *Engine) initialize(ctx context.Context, options ...Option) error {
 	return nil
 }
 
+func (e *Engine) initSourceManager(ctx context.Context) {
+	opts := []func(*sources.SourceManager){
+		sources.WithConcurrentSources(int(e.concurrency)),
+		sources.WithConcurrentUnits(int(e.concurrency)),
+		sources.WithSourceUnits(),
+		sources.WithBufferedOutput(defaultChannelBuffer),
+	}
+	if e.jobReportWriter != nil {
+		var mu sync.Mutex
+		unitHook := sources.NewUnitHook(ctx, sources.OnUnitHookFinish(func(metrics sources.UnitMetrics) {
+			metrics.Errors = common.ExportErrors(metrics.Errors...)
+			details, err := json.Marshal(map[string]any{
+				"version": 1,
+				"data":    metrics,
+			})
+			if err != nil {
+				ctx.Logger().Error(err, "error marshalling job details")
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if _, err := e.jobReportWriter.Write(details); err != nil {
+				ctx.Logger().Error(err, "error writing to file")
+				return
+			}
+			if _, err := e.jobReportWriter.Write([]byte{'\n'}); err != nil {
+				ctx.Logger().Error(err, "error writing to file")
+			}
+		}))
+		opts = append(opts, sources.WithReportHook(unitHook))
+	}
+	e.sourceManager = sources.NewManager(opts...)
+}
+
 // setDefaults ensures that if specific engine properties aren't provided,
 // they're set to reasonable default values. It makes the engine robust to
 // incomplete configuration.
@@ -330,13 +374,6 @@ func (e *Engine) setDefaults(ctx context.Context) {
 		e.concurrency = uint8(numCPU)
 	}
 	ctx.Logger().V(3).Info("engine started", "workers", e.concurrency)
-
-	e.sourceManager = sources.NewManager(
-		sources.WithConcurrentSources(int(e.concurrency)),
-		sources.WithConcurrentUnits(int(e.concurrency)),
-		sources.WithSourceUnits(),
-		sources.WithBufferedOutput(defaultChannelBuffer),
-	)
 
 	// Default decoders handle common encoding formats.
 	if len(e.decoders) == 0 {
@@ -425,6 +462,10 @@ func (e *Engine) Finish(ctx context.Context) error {
 
 	close(e.results)    // Detector workers are done, close the results channel and call it a day.
 	e.WgNotifier.Wait() // Wait for the notifier workers to finish notifying results.
+
+	if e.jobReportWriter != nil {
+		_ = e.jobReportWriter.Close()
+	}
 
 	if err := cleantemp.CleanTempArtifacts(ctx); err != nil {
 		ctx.Logger().Error(err, "error cleaning temp artifacts")

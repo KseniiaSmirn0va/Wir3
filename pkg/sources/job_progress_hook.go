@@ -14,8 +14,9 @@ import (
 // UnitHook implements JobProgressHook for tracking the progress of each
 // individual unit.
 type UnitHook struct {
-	metrics *lru.Cache[string, *UnitMetrics]
-	mu      sync.Mutex
+	metrics    *lru.Cache[string, *UnitMetrics]
+	mu         sync.Mutex
+	finishFunc func(UnitMetrics)
 	NoopHook
 }
 
@@ -23,6 +24,10 @@ type UnitHookOpt func(*UnitHook)
 
 func WithUnitHookCache(cache *lru.Cache[string, *UnitMetrics]) UnitHookOpt {
 	return func(hook *UnitHook) { hook.metrics = cache }
+}
+
+func OnUnitHookFinish(f func(UnitMetrics)) UnitHookOpt {
+	return func(hook *UnitHook) { hook.finishFunc = f }
 }
 
 func NewUnitHook(ctx context.Context, opts ...UnitHookOpt) *UnitHook {
@@ -142,6 +147,9 @@ func (u *UnitHook) Finish(ref JobProgressRef) {
 			metric.StartTime = snap.StartTime
 			metric.EndTime = snap.EndTime
 			metric.Errors = snap.Errors
+		}
+		if u.finishFunc != nil {
+			go u.finishFunc(*metric)
 		}
 	}
 }
