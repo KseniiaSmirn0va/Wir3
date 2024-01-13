@@ -79,6 +79,9 @@ func (u *UnitHook) EndUnitChunking(ref JobProgressRef, unit SourceUnit, end time
 		return
 	}
 	metrics.EndTime = &end
+	if u.finishFunc != nil {
+		go u.finishFunc(*metrics)
+	}
 }
 
 func (u *UnitHook) ReportChunk(ref JobProgressRef, unit SourceUnit, chunk *Chunk) {
@@ -147,9 +150,9 @@ func (u *UnitHook) Finish(ref JobProgressRef) {
 			metric.StartTime = snap.StartTime
 			metric.EndTime = snap.EndTime
 			metric.Errors = snap.Errors
-		}
-		if u.finishFunc != nil {
-			go u.finishFunc(*metric)
+			if u.finishFunc != nil {
+				go u.finishFunc(*metric)
+			}
 		}
 	}
 }

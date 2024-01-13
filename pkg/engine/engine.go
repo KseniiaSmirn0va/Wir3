@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	lru "github.com/hashicorp/golang-lru"
 	"google.golang.org/protobuf/proto"
 
@@ -339,26 +340,28 @@ func (e *Engine) initSourceManager(ctx context.Context) {
 	}
 	if e.jobReportWriter != nil {
 		var mu sync.Mutex
-		unitHook := sources.NewUnitHook(ctx, sources.OnUnitHookFinish(func(metrics sources.UnitMetrics) {
-			metrics.Errors = common.ExportErrors(metrics.Errors...)
-			details, err := json.Marshal(map[string]any{
-				"version": 1,
-				"data":    metrics,
-			})
-			if err != nil {
-				ctx.Logger().Error(err, "error marshalling job details")
-				return
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if _, err := e.jobReportWriter.Write(details); err != nil {
-				ctx.Logger().Error(err, "error writing to file")
-				return
-			}
-			if _, err := e.jobReportWriter.Write([]byte{'\n'}); err != nil {
-				ctx.Logger().Error(err, "error writing to file")
-			}
-		}))
+		// Pass a discard logger for the unit hook to ignore the LRU cache eviction logs.
+		unitHook := sources.NewUnitHook(context.WithLogger(ctx, logr.Discard()),
+			sources.OnUnitHookFinish(func(metrics sources.UnitMetrics) {
+				metrics.Errors = common.ExportErrors(metrics.Errors...)
+				details, err := json.Marshal(map[string]any{
+					"version": 1,
+					"data":    metrics,
+				})
+				if err != nil {
+					ctx.Logger().Error(err, "error marshalling job details")
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if _, err := e.jobReportWriter.Write(details); err != nil {
+					ctx.Logger().Error(err, "error writing to file")
+					return
+				}
+				if _, err := e.jobReportWriter.Write([]byte{'\n'}); err != nil {
+					ctx.Logger().Error(err, "error writing to file")
+				}
+			}))
 		opts = append(opts, sources.WithReportHook(unitHook))
 	}
 	e.sourceManager = sources.NewManager(opts...)
