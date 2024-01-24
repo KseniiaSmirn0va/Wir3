@@ -71,8 +71,10 @@ type Engine struct {
 	sourceManager        *sources.SourceManager
 	results              chan detectors.ResultWithMetadata
 	detectableChunksChan chan detectableChunk
+	chunkChan            chan *sources.Chunk
 	workersWg            sync.WaitGroup
 	wgDetectorWorkers    sync.WaitGroup
+	wgChunkWorkers       sync.WaitGroup
 	WgNotifier           sync.WaitGroup
 
 	// Runtime information.
@@ -307,6 +309,7 @@ func (e *Engine) initialize(ctx context.Context, options ...Option) error {
 	e.dedupeCache = cache
 	e.printer = new(output.PlainPrinter)
 	e.metrics = runtimeMetrics{Metrics: Metrics{scanStartTime: time.Now()}}
+	e.chunkChan = make(chan *sources.Chunk, defaultChannelBuffer)
 
 	for _, option := range options {
 		option(e)
@@ -376,6 +379,19 @@ func (e *Engine) startWorkers(ctx context.Context) {
 			defer common.Recover(ctx)
 			defer e.workersWg.Done()
 			e.detectorWorker(ctx)
+		}()
+	}
+
+	// Chunk workers apply keyword matching, regexes and API calls to detect secrets in chunks.
+	const chunkWorkerMultipler = 50
+	ctx.Logger().V(2).Info("starting detector workers", "count", e.concurrency*chunkWorkerMultipler)
+	for worker := uint64(0); worker < uint64(e.concurrency*chunkWorkerMultipler); worker++ {
+		e.wgChunkWorkers.Add(1)
+		go func() {
+			ctx := context.WithValue(ctx, "detector_worker_id", common.RandomID(5))
+			defer common.Recover(ctx)
+			defer e.wgChunkWorkers.Done()
+			e.chunkWorker(ctx)
 		}()
 	}
 
@@ -459,39 +475,13 @@ type detectableChunk struct {
 }
 
 func (e *Engine) detectorWorker(ctx context.Context) {
-	var wgDetect sync.WaitGroup
-
 	// Reuse the same map to avoid allocations.
-	const avgDetectorsPerChunk = 2
-	chunkSpecificDetectors := make(map[DetectorKey]detectors.Detector, avgDetectorsPerChunk)
 	for originalChunk := range e.ChunksChan() {
 		for chunk := range sources.Chunker(originalChunk) {
-			atomic.AddUint64(&e.metrics.BytesScanned, uint64(len(chunk.Data)))
-			for _, decoder := range e.decoders {
-				decoded := decoder.FromChunk(chunk)
-				if decoded == nil {
-					ctx.Logger().V(4).Info("no decoder found for chunk", "chunk", chunk)
-					continue
-				}
-
-				e.ahoCorasickCore.PopulateMatchingDetectors(string(decoded.Chunk.Data), chunkSpecificDetectors)
-
-				for k, detector := range chunkSpecificDetectors {
-					decoded.Chunk.Verify = e.verify
-					wgDetect.Add(1)
-					e.detectableChunksChan <- detectableChunk{
-						chunk:    *decoded.Chunk,
-						detector: detector,
-						decoder:  decoded.DecoderType,
-						wgDoneFn: wgDetect.Done,
-					}
-					delete(chunkSpecificDetectors, k)
-				}
-			}
+			e.chunkChan <- chunk
 		}
 		atomic.AddUint64(&e.metrics.ChunksScanned, 1)
 	}
-	wgDetect.Wait()
 	ctx.Logger().V(4).Info("finished scanning chunks")
 }
 
@@ -499,6 +489,37 @@ func (e *Engine) detectChunks(ctx context.Context) {
 	for data := range e.detectableChunksChan {
 		e.detectChunk(ctx, data)
 	}
+}
+
+func (e *Engine) chunkWorker(ctx context.Context) {
+	const avgDetectorsPerChunk = 2
+	chunkSpecificDetectors := make(map[DetectorKey]detectors.Detector, avgDetectorsPerChunk)
+	var wgDetect sync.WaitGroup
+
+	for chunk := range e.chunkChan {
+		atomic.AddUint64(&e.metrics.BytesScanned, uint64(len(chunk.Data)))
+		for _, decoder := range e.decoders {
+			decoded := decoder.FromChunk(chunk)
+			if decoded == nil {
+				ctx.Logger().V(4).Info("no decoder found for chunk", "chunk", chunk)
+				continue
+			}
+			e.ahoCorasickCore.PopulateMatchingDetectors(string(decoded.Chunk.Data), chunkSpecificDetectors)
+
+			for k, detector := range chunkSpecificDetectors {
+				decoded.Chunk.Verify = e.verify
+				wgDetect.Add(1)
+				e.detectableChunksChan <- detectableChunk{
+					chunk:    *decoded.Chunk,
+					detector: detector,
+					decoder:  decoded.DecoderType,
+					wgDoneFn: wgDetect.Done,
+				}
+				delete(chunkSpecificDetectors, k)
+			}
+		}
+	}
+	wgDetect.Wait()
 }
 
 func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
