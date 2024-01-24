@@ -383,7 +383,7 @@ func (e *Engine) startWorkers(ctx context.Context) {
 	}
 
 	// Chunk workers apply keyword matching, regexes and API calls to detect secrets in chunks.
-	const chunkWorkerMultipler = 50
+	const chunkWorkerMultipler = 10
 	ctx.Logger().V(2).Info("starting detector workers", "count", e.concurrency*chunkWorkerMultipler)
 	for worker := uint64(0); worker < uint64(e.concurrency*chunkWorkerMultipler); worker++ {
 		e.wgChunkWorkers.Add(1)
@@ -495,6 +495,10 @@ func (e *Engine) chunkWorker(ctx context.Context) {
 	const avgDetectorsPerChunk = 2
 	chunkSpecificDetectors := make(map[DetectorKey]detectors.Detector, avgDetectorsPerChunk)
 	var wgDetect sync.WaitGroup
+	var wgChunk sync.WaitGroup
+	var sem = make(chan int, 50)
+
+	carefulChunkHelper := NewCarefulChunkLookup()
 
 	for chunk := range e.chunkChan {
 		atomic.AddUint64(&e.metrics.BytesScanned, uint64(len(chunk.Data)))
@@ -507,6 +511,37 @@ func (e *Engine) chunkWorker(ctx context.Context) {
 			e.ahoCorasickCore.PopulateMatchingDetectors(string(decoded.Chunk.Data), chunkSpecificDetectors)
 
 			for k, detector := range chunkSpecificDetectors {
+				k := k
+				decodedChunk := decoded.Chunk
+				decodedChunk.Verify = false
+				detector := detector
+				wgChunk.Add(1)
+				sem <- 1
+				go func() {
+					chunk := detectableChunk{
+						chunk:    *decodedChunk,
+						detector: detector,
+						decoder:  decoded.DecoderType,
+						wgDoneFn: wgDetect.Done,
+					}
+					results := e.detectChunkSimple(ctx, chunk)
+					if len(results) == 0 {
+						// delete(chunkSpecificDetectors, k)
+						carefulChunkHelper.AddSkippableDetector(k, detector)
+					}
+					for _, result := range results {
+						carefulChunkHelper.AddResult(k, string(result.Raw))
+					}
+					<-sem
+					wgChunk.Done()
+				}()
+			}
+			wgChunk.Wait()
+
+			for k, detector := range chunkSpecificDetectors {
+				if _, exists := carefulChunkHelper.GetSkippableDetectors()[k]; exists {
+					continue
+				}
 				decoded.Chunk.Verify = e.verify
 				wgDetect.Add(1)
 				e.detectableChunksChan <- detectableChunk{
@@ -520,6 +555,18 @@ func (e *Engine) chunkWorker(ctx context.Context) {
 		}
 	}
 	wgDetect.Wait()
+}
+
+func (e *Engine) detectChunkSimple(ctx context.Context, data detectableChunk) []detectors.Result {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer common.Recover(ctx)
+	defer cancel()
+
+	results, err := data.detector.FromData(ctx, data.chunk.Verify, data.chunk.Data)
+	if err != nil {
+		ctx.Logger().Error(err, "error scanning chunk")
+	}
+	return results
 }
 
 func (e *Engine) detectChunk(ctx context.Context, data detectableChunk) {
